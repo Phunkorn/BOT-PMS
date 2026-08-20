@@ -1,0 +1,67 @@
+{
+  "plate_no": {
+    "auto_id": "AcarID",
+    "class_contains": "EDIT"
+  },
+  "visit_no": {
+    "auto_id": "AcarMile",
+    "class_contains": "EDIT"
+  },
+  "chassis_no": {
+    "auto_id": "Tเลขตัวถัง",
+    "class_contains": "EDIT"
+  },
+  "warranty_no": {
+    "auto_id": "Tเครื่อง",
+    "class_contains": "EDIT"
+  },
+  "brand_model": {
+    "auto_id": "AcarBrand",
+    "class_contains": "EDIT"
+  },
+  "color": {
+    "auto_id": "Tสี",
+    "class_contains": "EDIT"
+  },
+  "job_date": {
+    "auto_id": "Adate",
+    "class_contains": "SysDateTimePick32"
+  },
+  "return_date": {
+    "auto_id": "DateTimePicker1",
+    "class_contains": "SysDateTimePick32"
+  },
+  "claim_no": {
+    "auto_id": "Tรับแจ้ง",
+    "class_contains": "EDIT"
+  },
+  "reference_no": {
+    "auto_id": "Tเคลม",
+    "class_contains": "EDIT"
+  },
+  "customer_name_2": {
+    "auto_id": "AName2",
+    "class_contains": "EDIT"
+  },
+  "service_code": {
+    "auto_id": "Tno",
+    "class_contains": "EDIT"
+  },
+  "service_qty": {
+    "auto_id": "Tnum",
+    "class_contains": "EDIT"
+  },
+  "service_name": {
+    "auto_id": "Tname",
+    "class_contains": "EDIT"
+  },
+  "service_add_button": {
+    "auto_id": "BsaveEdit"
+  },
+  "service_list": {
+    "auto_id": "ListView1"
+  },
+  "save_job_button": {
+    "auto_id": "ButtonX3"
+  }
+}
