@@ -1,0 +1,2 @@
+APP_NAME = "T.V.C JOB BOT"
+APP_VERSION = "0.8.0"
