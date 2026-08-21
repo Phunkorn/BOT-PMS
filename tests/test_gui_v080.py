@@ -1,6 +1,8 @@
 from pathlib import Path
 import queue
+import subprocess
 import tempfile
+import time
 import tkinter as tk
 import unittest
 from unittest import mock
@@ -508,6 +510,215 @@ class PrecheckTests(unittest.TestCase):
         thread.return_value.start.assert_called_once()
 
 
+class PrecheckResponsivenessTests(unittest.TestCase):
+    def setUp(self):
+        self.path=Path("queue responsiveness.xlsx").resolve()
+
+    @staticmethod
+    def attach_buttons(app):
+        app.stop_request_sent=False
+        for name in (
+            "start_button","stop_button","browse_button","remove_button",
+            "clear_button","up_button","down_button","runtime_button",
+            "safety_button",
+        ):
+            setattr(app,name,mock.Mock())
+
+    def test_tvc_probe_subprocess_timeout_returns_explicit_timeout(self):
+        def timed_out(*_args,**_kwargs):
+            raise subprocess.TimeoutExpired(["probe"],0.01)
+
+        result=tvc_control.check_tvc_client(
+            tvc_control.RUNTIME_PATHS.source_python,
+            timeout_seconds=0.01,
+            runner=timed_out,
+        )
+        self.assertEqual(result["status"],"TIMEOUT")
+        self.assertTrue(result["timed_out"])
+        self.assertFalse(result["connected"])
+
+    def test_real_probe_process_is_terminated_at_hard_timeout(self):
+        with tempfile.TemporaryDirectory(prefix="tvc bounded probe ") as tmp:
+            root=Path(tmp)/"App With Spaces"
+            probe_script=root/"src"/"tvc_probe.py"
+            probe_script.parent.mkdir(parents=True)
+            probe_script.write_text(
+                "import time\ntime.sleep(30)\n",encoding="utf-8"
+            )
+            paths=resolve_runtime_paths(
+                frozen=False,
+                module_file=root/"src"/"runtime_paths.py",
+                writable_probe=lambda _path:True,
+            )
+            started=time.monotonic()
+            result=tvc_control.check_tvc_client(
+                Path(sys.executable),
+                runtime_paths=paths,
+                timeout_seconds=0.15,
+            )
+            elapsed=time.monotonic()-started
+        self.assertEqual(result["status"],"TIMEOUT")
+        self.assertTrue(result["timed_out"])
+        self.assertLess(elapsed,2.0)
+
+    def test_timeout_result_releases_precheck_state_and_queue_controls(self):
+        app=make_controller_app([])
+        self.attach_buttons(app)
+        app.precheck_in_progress=True
+        app.precheck_purpose="manual"
+        app.runtime_check_in_progress=True
+        app.precheck_valid=False
+        app.valid_excel=False
+        result={
+            "runtime":{"ready":True,"python":str(Path("python.exe").resolve()),"message":"Ready"},
+            "tvc":{
+                "ready":False,"connected":False,"login_verified":False,
+                "status":"TIMEOUT","timed_out":True,"duration_ms":4000,
+                "message":"T.V.C probe หมดเวลา",
+            },
+            "items":[],"queue_ready":False,"queue_message":"ยังไม่ได้เลือก Excel",
+            "total_wait":0,"ready":False,
+        }
+        app._on_precheck_result(app.precheck_generation,result)
+        tvc_control.TVCControlApp._update_buttons(app)
+        self.assertFalse(app.precheck_in_progress)
+        self.assertFalse(app.runtime_check_in_progress)
+        self.assertEqual(app.tvc_status_var.get(),"หมดเวลาตรวจสอบ")
+        self.assertEqual(
+            app.browse_button.configure.call_args.kwargs["state"],"normal"
+        )
+        self.assertEqual(
+            app.start_button.configure.call_args.kwargs["state"],"disabled"
+        )
+
+    def test_queue_controls_enabled_while_manual_probe_running_or_not_found(self):
+        for running in (True,False):
+            with self.subTest(precheck_running=running):
+                app=make_controller_app([self.path])
+                self.attach_buttons(app)
+                app.precheck_valid=False
+                app.runtime_valid=True
+                app.tvc_connected=False
+                app.tvc_login_verified=False
+                app.precheck_in_progress=running
+                app.precheck_purpose="manual"
+                app.runtime_check_in_progress=running
+                tvc_control.TVCControlApp._update_buttons(app)
+                for name in (
+                    "browse_button","remove_button","clear_button",
+                    "up_button","down_button",
+                ):
+                    button=getattr(app,name)
+                    self.assertEqual(
+                        button.configure.call_args.kwargs["state"],"normal",name
+                    )
+                self.assertEqual(
+                    app.start_button.configure.call_args.kwargs["state"],"disabled"
+                )
+
+    def test_add_excel_during_manual_probe_invalidates_old_generation_and_retries(self):
+        app=make_controller_app([])
+        app.precheck_in_progress=True
+        app.precheck_purpose="manual"
+        app.runtime_check_in_progress=True
+        old_generation=app.precheck_generation
+        app.retry_precheck=mock.Mock()
+        with mock.patch.object(
+            tvc_control.filedialog,"askopenfilenames",return_value=(str(self.path),)
+        ):
+            app.choose_excel()
+        self.assertEqual(len(app.excel_queue.items),1)
+        self.assertGreater(app.precheck_generation,old_generation)
+        self.assertFalse(app.precheck_in_progress)
+        app.retry_precheck.assert_called_once_with()
+
+    def test_clear_queue_during_manual_probe_retries_with_fresh_generation(self):
+        app=make_controller_app([self.path])
+        app.precheck_in_progress=True
+        app.precheck_purpose="manual"
+        app.runtime_check_in_progress=True
+        old_generation=app.precheck_generation
+        app.retry_precheck=mock.Mock()
+        app.clear_files()
+        self.assertEqual(app.excel_queue.items,[])
+        self.assertGreater(app.precheck_generation,old_generation)
+        self.assertFalse(app.precheck_in_progress)
+        app.retry_precheck.assert_called_once_with()
+
+    def test_stale_probe_result_cannot_overwrite_current_state(self):
+        app=make_controller_app([])
+        app.precheck_generation=9
+        app.precheck_in_progress=True
+        app.runtime_status_var.set("กำลังตรวจสอบ")
+        app.tvc_status_var.set("กำลังตรวจสอบ")
+        stale={
+            "runtime":{"ready":True,"python":str(Path("python.exe").resolve()),"message":"Ready"},
+            "tvc":{
+                "ready":True,"connected":True,"login_verified":True,
+                "status":"READY","message":"Connected",
+            },
+            "items":[],"queue_ready":False,"queue_message":"old",
+            "total_wait":0,"ready":False,
+        }
+        app._on_precheck_result(8,stale)
+        self.assertTrue(app.precheck_in_progress)
+        self.assertEqual(app.tvc_status_var.get(),"กำลังตรวจสอบ")
+        self.assertEqual(app.queue_status_var.get(),"Ready")
+
+    def test_refresh_can_move_tvc_from_not_found_to_ready(self):
+        app=make_controller_app([self.path])
+        not_found={
+            "runtime":{"ready":True,"python":str(Path("python.exe").resolve()),"message":"Ready"},
+            "tvc":{
+                "ready":False,"connected":False,"login_verified":False,
+                "status":"NOT_FOUND","message":"ไม่พบ T.V.C Client",
+            },
+            "items":[{
+                "path":str(self.path),"status":"READY","stats":stats(wait=1),
+                "errors":[],"safety_issues":[],"message":"READY",
+            }],
+            "queue_ready":True,"queue_message":"Ready","total_wait":1,"ready":False,
+        }
+        app._on_precheck_result(app.precheck_generation,not_found)
+        self.assertEqual(app.tvc_status_var.get(),"ยังไม่พบโปรแกรม")
+        self.assertFalse(app.precheck_valid)
+
+        app.precheck_generation+=1
+        ready={**not_found,"ready":True,"tvc":{
+            **not_found["tvc"],"ready":True,"connected":True,
+            "login_verified":True,"status":"READY","message":"Connected",
+        }}
+        app._on_precheck_result(app.precheck_generation,ready)
+        self.assertEqual(app.tvc_status_var.get(),"พร้อม")
+        self.assertTrue(app.precheck_valid)
+
+    def test_login_required_keeps_start_disabled_and_explains_state(self):
+        app=make_controller_app([self.path])
+        self.attach_buttons(app)
+        result={
+            "runtime":{"ready":True,"python":str(Path("python.exe").resolve()),"message":"Ready"},
+            "tvc":{
+                "ready":False,"connected":True,"login_verified":False,
+                "status":"LOGIN_REQUIRED",
+                "message":"พบ T.V.C แต่ยังยืนยันการเข้าสู่ระบบไม่ได้",
+            },
+            "items":[{
+                "path":str(self.path),"status":"READY","stats":stats(wait=1),
+                "errors":[],"safety_issues":[],"message":"READY",
+            }],
+            "queue_ready":True,"queue_message":"Ready","total_wait":1,"ready":False,
+        }
+        app._on_precheck_result(app.precheck_generation,result)
+        tvc_control.TVCControlApp._update_buttons(app)
+        self.assertEqual(
+            app.tvc_status_var.get(),"พบโปรแกรม - ยังไม่ยืนยัน Login"
+        )
+        self.assertFalse(app.precheck_valid)
+        self.assertEqual(
+            app.start_button.configure.call_args.kwargs["state"],"disabled"
+        )
+
+
 class StartTimeRevalidationTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(prefix="tvc_start_revalidate_")
@@ -557,6 +768,24 @@ class StartTimeRevalidationTests(unittest.TestCase):
         self.assertTrue(app.start_pending)
         self.assertTrue(app.excel_queue.locked)
         app._begin_precheck.assert_called_once_with("start")
+
+    def test_start_time_precheck_rechecks_tvc_and_blocks_if_it_closed(self):
+        checker=mock.Mock(return_value={
+            "status":"NOT_FOUND","connected":False,"login_verified":False,
+            "matches":[],
+        })
+        result=tvc_control.perform_precheck(
+            [self.path],
+            runtime_validator=lambda:self.runtime,
+            tvc_checker=checker,
+            workbook_validator=lambda _path:True,
+            access_checker=lambda _path:True,
+            stats_reader=lambda _path:stats(wait=1),
+            errors_reader=lambda _path:[],
+        )
+        checker.assert_called_once_with(self.runtime)
+        self.assertFalse(result["tvc"]["ready"])
+        self.assertFalse(result["ready"])
 
     def test_cached_pass_then_running_appears_blocks_start(self):
         app=make_controller_app([self.path])
@@ -1524,36 +1753,212 @@ class TvcProbeTests(unittest.TestCase):
         class Window:
             def window_text(self):
                 return "เพิ่มใบงาน (JOB)"
+            def children(self):
+                raise AssertionError("JOB title match must not need a control walk")
 
         desktop=mock.Mock()
         desktop.windows.return_value=[Window()]
         with mock.patch.object(tvc_probe,"Desktop",return_value=desktop):
             result=tvc_probe.probe()
+        self.assertEqual(result["status"],"READY")
         self.assertTrue(result["connected"])
         self.assertTrue(result["login_verified"])
         self.assertTrue(result["active_job_form"])
-        self.assertEqual(desktop.windows.call_count,2)
+        self.assertEqual(desktop.windows.call_count,1)
 
     def test_probe_detects_reusable_job_form_by_controls_without_clicking(self):
         class Info:
-            def __init__(self,automation_id):
+            def __init__(self,automation_id="",process_id=42):
                 self.automation_id=automation_id
+                self.process_id=process_id
 
         class Control:
             def __init__(self,automation_id):
                 self.element_info=Info(automation_id)
+            def children(self):
+                return []
 
-        class Window:
+        class MainWindow:
+            element_info=Info()
+            def window_text(self):
+                return "T.V.C Client [Version 1.8.2]"
+            def class_name(self):
+                return "WindowsForms10.Window"
+
+        class JobWindow:
+            element_info=Info()
             def window_text(self):
                 return "ข้อมูลรถ - งานปัจจุบัน"
-            def descendants(self):
+            def class_name(self):
+                return "WindowsForms10.Window"
+            def children(self):
                 return [Control("ButtonX3"),Control("ListView1"),Control("Tno")]
 
-        desktop=mock.Mock()
-        desktop.windows.return_value=[Window()]
-        with mock.patch.object(tvc_probe,"Desktop",return_value=desktop):
+        win32_desktop=mock.Mock()
+        win32_desktop.windows.return_value=[MainWindow()]
+        uia_desktop=mock.Mock()
+        uia_desktop.windows.return_value=[JobWindow()]
+
+        def desktop_factory(*,backend):
+            return uia_desktop if backend=="uia" else win32_desktop
+
+        with mock.patch.object(tvc_probe,"Desktop",side_effect=desktop_factory):
             result=tvc_probe.probe()
+        self.assertEqual(result["status"],"READY")
+        self.assertTrue(result["login_verified"])
+        self.assertIn("active_job_form_controls",result["login_signals"])
         self.assertTrue(result["active_job_form"])
+        uia_desktop.windows.assert_called_once_with(process=42)
+
+    def test_client_before_login_without_positive_signal_is_login_required(self):
+        class Info:
+            process_id=51
+            automation_id=""
+
+        class Window:
+            element_info=Info()
+            def __init__(self,title=""):
+                self.title=title
+            def window_text(self):
+                return self.title
+            def class_name(self):
+                return "WindowsForms10.Window"
+            def children(self):
+                return []
+
+        win32=mock.Mock()
+        win32.windows.return_value=[Window("T.V.C Client [Version 1.8.2]")]
+        uia=mock.Mock()
+        uia.windows.return_value=[Window("T.V.C Client [Version 1.8.2]")]
+        result=tvc_probe.probe(
+            desktop_factory=lambda *,backend:uia if backend=="uia" else win32
+        )
+        self.assertEqual(result["status"],"LOGIN_REQUIRED")
+        self.assertTrue(result["connected"])
+        self.assertFalse(result["login_verified"])
+        self.assertEqual(result["login_signals"],[])
+
+    def test_logged_in_user_title_is_a_positive_signal(self):
+        class Info:
+            process_id=52
+
+        class MainWindow:
+            element_info=Info()
+            def window_text(self):
+                return "T.V.C Client [Version 1.8.2] เข้าสู่ระบบโดย ADMINPREMIUM []"
+            def class_name(self):
+                return "WindowsForms10.Window"
+
+        win32=mock.Mock()
+        win32.windows.return_value=[MainWindow()]
+        uia=mock.Mock()
+        uia.windows.side_effect=AssertionError(
+            "verified logged-in title must not trigger UIA control enumeration"
+        )
+        result=tvc_probe.probe(
+            desktop_factory=lambda *,backend:uia if backend=="uia" else win32
+        )
+        self.assertEqual(result["status"],"READY")
+        self.assertTrue(result["login_verified"])
+        self.assertIn("logged_in_user_title",result["login_signals"])
+        uia.windows.assert_not_called()
+
+    def test_post_login_job_menu_control_makes_neutral_title_ready(self):
+        class Info:
+            def __init__(self,process_id=53):
+                self.process_id=process_id
+                self.automation_id=""
+
+        class Control:
+            element_info=Info()
+            def window_text(self):
+                return "ใบงาน"
+            def children(self):
+                return []
+
+        class Window:
+            element_info=Info()
+            def __init__(self,title=""):
+                self.title=title
+            def window_text(self):
+                return self.title
+            def class_name(self):
+                return "WindowsForms10.Window"
+            def children(self):
+                return [Control()]
+
+        win32=mock.Mock()
+        win32.windows.return_value=[Window("T.V.C Client [Version 1.8.2]")]
+        uia=mock.Mock()
+        uia.windows.return_value=[Window("หน้าหลัก")]
+        result=tvc_probe.probe(
+            desktop_factory=lambda *,backend:uia if backend=="uia" else win32
+        )
+        self.assertEqual(result["status"],"READY")
+        self.assertTrue(result["login_verified"])
+        self.assertIn("post_login_control:ใบงาน",result["login_signals"])
+
+    def test_login_word_alone_is_not_a_positive_signal(self):
+        class Info:
+            process_id=54
+            automation_id=""
+
+        class Window:
+            element_info=Info()
+            def window_text(self):
+                return "T.V.C Client - Login"
+            def class_name(self):
+                return "WindowsForms10.Window"
+            def children(self):
+                return []
+
+        win32=mock.Mock()
+        win32.windows.return_value=[Window()]
+        uia=mock.Mock()
+        uia.windows.return_value=[Window()]
+        result=tvc_probe.probe(
+            desktop_factory=lambda *,backend:uia if backend=="uia" else win32
+        )
+        self.assertEqual(result["status"],"LOGIN_REQUIRED")
+        self.assertFalse(result["login_verified"])
+
+    def test_probe_not_found_is_fast_and_never_inspects_unrelated_controls(self):
+        class UnrelatedWindow:
+            def window_text(self):
+                return "Visual Studio Code"
+            def class_name(self):
+                return "Chrome_WidgetWin_1"
+            def children(self):
+                raise AssertionError("unrelated controls must not be inspected")
+
+        desktop=mock.Mock()
+        desktop.windows.return_value=[UnrelatedWindow()]
+        started=time.monotonic()
+        with mock.patch.object(tvc_probe,"Desktop",return_value=desktop):
+            result=tvc_probe.probe(timeout_seconds=0.5)
+        elapsed=time.monotonic()-started
+        self.assertEqual(result["status"],"NOT_FOUND")
+        self.assertFalse(result["connected"])
+        self.assertLess(elapsed,0.5)
+        self.assertEqual(desktop.windows.call_count,1)
+
+    def test_probe_internal_deadline_returns_timeout(self):
+        class Clock:
+            def __init__(self):
+                self.value=0.0
+            def __call__(self):
+                self.value+=0.2
+                return self.value
+
+        desktop=mock.Mock()
+        desktop.windows.return_value=[]
+        result=tvc_probe.probe(
+            timeout_seconds=0.1,
+            desktop_factory=lambda **_kwargs:desktop,
+            clock=Clock(),
+        )
+        self.assertEqual(result["status"],"TIMEOUT")
+        self.assertTrue(result["timed_out"])
 
 
 class CliCompatibilityTests(unittest.TestCase):

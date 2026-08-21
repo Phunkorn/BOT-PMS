@@ -9,7 +9,7 @@ from excel_io import (
     write_service_result,
 )
 from tvc_driver import TVCDriver
-from utils import stamp
+from utils import configure_utf8_stdio,stamp
 from version import APP_NAME, APP_VERSION
 from runtime_paths import resolve_runtime_paths
 
@@ -30,7 +30,9 @@ def parse_args(argv=None):
 
 def emit_event(event,**values):
     payload={"event":event,**values}
-    print(EVENT_PREFIX+json.dumps(payload,ensure_ascii=False),flush=True)
+    # IPC stays 7-bit clean even when values contain Thai text. The GUI can
+    # therefore parse events independently of the target machine code page.
+    print(EVENT_PREFIX+json.dumps(payload,ensure_ascii=True),flush=True)
 
 
 def stop_requested(stop_file):
@@ -38,6 +40,7 @@ def stop_requested(stop_file):
 
 
 def main(argv=None):
+    configure_utf8_stdio()
     args=parse_args(argv)
     cfg=configparser.ConfigParser()
     cfg.read(RUNTIME_PATHS.config_file,encoding="utf-8")

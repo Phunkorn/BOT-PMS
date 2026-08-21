@@ -8,6 +8,7 @@ import time
 from pywinauto import Desktop
 from pywinauto.keyboard import send_keys
 from pywinauto.mouse import click as mouse_click
+import tvc_window_locator
 
 
 class TVCDriver:
@@ -76,27 +77,15 @@ class TVCDriver:
 
         return None
 
-    def _find_tvc_main_window_uia(self):
-        d = Desktop(backend="uia")
-
-        for w in d.windows():
-            try:
-                title = w.window_text() or ""
-                if "T.V.C Client" in title and "รายการใบงาน (JOB)" in title:
-                    return w
-            except Exception:
-                pass
-
-        # Fallback if the child page title isn't appended to the main caption.
-        for w in d.windows():
-            try:
-                title = w.window_text() or ""
-                if "T.V.C Client" in title:
-                    return w
-            except Exception:
-                pass
-
-        return None
+    def _find_tvc_main_window(self):
+        """Resolve the same verified top-level window accepted by pre-check."""
+        result=tvc_window_locator.locate_tvc_main_window(
+            self.backend,
+            timeout_seconds=1.5,
+        )
+        if result.selected is None:
+            return None
+        return result.selected.window
 
     def _wait_job_window(self, timeout=6.0):
         end = time.time() + timeout
@@ -139,7 +128,7 @@ class TVCDriver:
             print("OPEN JOB: หน้าเพิ่มใบงานเปิดอยู่แล้ว")
             return existing
 
-        main = self._find_tvc_main_window_uia()
+        main = self._find_tvc_main_window()
         if main is None:
             raise RuntimeError(
                 "ไม่พบหน้าต่างหลัก T.V.C Client สำหรับเปิดใบงานใหม่"

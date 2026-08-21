@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import uuid
 
@@ -54,6 +55,8 @@ EVENT_PREFIX="TVCBOT_EVENT "
 STATS_INTERVAL_MS=1500
 STOP_TIMEOUT_MS=300000
 RUNTIME_CHECK_TIMEOUT_SECONDS=8
+TVC_PROBE_TIMEOUT_SECONDS=4
+TVC_PROBE_RESULT_PREFIX="TVC_PROBE_RESULT "
 REQUIRED_BOT_MODULES=("openpyxl","pywinauto","psutil")
 QUEUE_STATUS_LABELS={
     "PENDING":"รอตรวจสอบ",
@@ -245,11 +248,93 @@ def validate_bot_runtime(python_exe: Path | None=None,runtime_paths=None):
     return python_exe.resolve()
 
 
-def check_tvc_client(_runtime_executable: Path):
-    """Call the read-only probe directly after dependency preflight."""
-    if probe_tvc_client is None:
-        raise RuntimeError("ยังไม่ได้โหลด read-only T.V.C probe")
-    return probe_tvc_client()
+def _probe_error_result(status,message,duration_ms=0):
+    return {
+        "status":status,
+        "connected":False,
+        "login_verified":False,
+        "active_job_form":False,
+        "active_job_forms":[],
+        "matches":[],
+        "login_signals":[],
+        "errors":[str(message)],
+        "timed_out":status=="TIMEOUT",
+        "duration_ms":int(duration_ms or 0),
+    }
+
+
+def build_tvc_probe_command(runtime_executable: Path,runtime_paths=None):
+    """Build an isolated probe command for source and frozen deployments."""
+    paths=runtime_paths or RUNTIME_PATHS
+    if paths is None:
+        raise RuntimeError(RUNTIME_PATH_ERROR or "ไม่พบ runtime paths")
+    executable=Path(runtime_executable)
+    if paths.frozen:
+        return [str(executable),"--probe-tvc"]
+    probe_script=paths.app_dir/"src"/"tvc_probe.py"
+    if not probe_script.is_file():
+        raise FileNotFoundError(f"ไม่พบ T.V.C probe script: {probe_script}")
+    return [str(executable),"-u",str(probe_script)]
+
+
+def check_tvc_client(
+    runtime_executable: Path,
+    *,
+    runtime_paths=None,
+    timeout_seconds=TVC_PROBE_TIMEOUT_SECONDS,
+    runner=None,
+):
+    """Run the read-only probe in a killable subprocess with a hard timeout."""
+    runner=runner or subprocess.run
+    paths=runtime_paths or RUNTIME_PATHS
+    command=build_tvc_probe_command(runtime_executable,paths)
+    started=time.monotonic()
+    try:
+        completed=runner(
+            command,
+            cwd=str(paths.app_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0),
+        )
+    except subprocess.TimeoutExpired:
+        duration_ms=round((time.monotonic()-started)*1000)
+        return _probe_error_result(
+            "TIMEOUT",
+            f"T.V.C probe timeout หลัง {timeout_seconds} วินาที",
+            duration_ms,
+        )
+    except (OSError,subprocess.SubprocessError) as exc:
+        duration_ms=round((time.monotonic()-started)*1000)
+        return _probe_error_result(
+            "ERROR",f"เรียก T.V.C probe ไม่สำเร็จ: {exc}",duration_ms
+        )
+
+    payload=None
+    for line in reversed((completed.stdout or "").splitlines()):
+        if line.startswith(TVC_PROBE_RESULT_PREFIX):
+            payload=line[len(TVC_PROBE_RESULT_PREFIX):]
+            break
+    if payload is None:
+        detail=(completed.stderr or completed.stdout or "ไม่มีผลลัพธ์จาก probe").strip()
+        return _probe_error_result("ERROR",detail)
+    try:
+        result=json.loads(payload)
+    except (TypeError,json.JSONDecodeError) as exc:
+        return _probe_error_result("ERROR",f"อ่านผล T.V.C probe ไม่สำเร็จ: {exc}")
+    connected=bool(result.get("connected"))
+    login_verified=bool(result.get("login_verified"))
+    result.setdefault(
+        "status",
+        "READY" if connected and login_verified else "FOUND" if connected else "NOT_FOUND",
+    )
+    result.setdefault("timed_out",result.get("status")=="TIMEOUT")
+    result.setdefault("errors",[])
+    result.setdefault("duration_ms",round((time.monotonic()-started)*1000))
+    return result
 
 
 def check_excel_access(path: Path):
@@ -324,11 +409,13 @@ def perform_precheck(
     result={
         "runtime":{"ready":False,"python":None,"message":""},
         "tvc":{
+            "status":"PENDING",
             "ready":False,
             "connected":False,
             "login_verified":False,
             "active_job_form":False,
             "active_job_forms":[],
+            "login_signals":[],
             "message":"",
         },
         "items":[],
@@ -351,10 +438,25 @@ def perform_precheck(
     if python_exe is not None:
         try:
             probe=tvc_checker(Path(python_exe))
+            probe_status=str(probe.get("status") or "").upper()
             connected=bool(probe.get("connected"))
             login_verified=bool(probe.get("login_verified"))
-            tvc_ready=connected and login_verified
-            if not connected:
+            if not probe_status:
+                probe_status=(
+                    "READY" if connected and login_verified
+                    else "FOUND" if connected
+                    else "NOT_FOUND"
+                )
+            tvc_ready=connected and login_verified and probe_status=="READY"
+            if probe_status=="TIMEOUT":
+                message=(
+                    f"T.V.C probe หมดเวลา ({probe.get('duration_ms',0)} ms) "
+                    "กรุณาลองตรวจสอบใหม่"
+                )
+            elif probe_status=="ERROR":
+                errors=list(probe.get("errors") or [])
+                message=errors[0] if errors else "T.V.C probe เกิดข้อผิดพลาด"
+            elif not connected:
                 message="ไม่พบ T.V.C Client กรุณาเปิดและเข้าสู่ระบบก่อน"
             elif not login_verified:
                 message="พบ T.V.C Client แต่ยังยืนยันการเข้าสู่ระบบไม่ได้"
@@ -368,10 +470,17 @@ def perform_precheck(
                 "active_job_forms":list(probe.get("active_job_forms") or []),
                 "message":message,
                 "matches":list(probe.get("matches") or []),
+                "login_signals":list(probe.get("login_signals") or []),
+                "status":probe_status,
+                "timed_out":bool(probe.get("timed_out")),
+                "errors":list(probe.get("errors") or []),
+                "duration_ms":int(probe.get("duration_ms",0) or 0),
             }
         except Exception as exc:
+            result["tvc"]["status"]="ERROR"
             result["tvc"]["message"]=str(exc)
     else:
+        result["tvc"]["status"]="SKIPPED"
         result["tvc"]["message"]="ยังไม่ได้ตรวจ T.V.C เพราะ Runtime ไม่พร้อม"
 
     for raw_path in paths:
@@ -416,7 +525,7 @@ def perform_precheck(
         and result["total_wait"]>0
     )
     if not result["items"]:
-        result["queue_message"]="ยังไม่มีไฟล์ Excel ใน Queue"
+        result["queue_message"]="ยังไม่ได้เลือก Excel"
     elif any(item["status"]=="REVIEW_REQUIRED" for item in result["items"]):
         result["queue_message"]="พบ Safety Lock กรุณาตรวจสอบงานก่อนเริ่มใหม่"
     elif not all(item["status"]=="READY" for item in result["items"]):
@@ -1014,7 +1123,13 @@ class TVCControlApp:
             self.queue_running
             or self._is_running()
             or self.recovery_in_progress
-            or self.precheck_in_progress
+            or self.start_pending
+            or self.finalization_in_progress
+            or self.excel_queue.locked
+            or (
+                self.precheck_in_progress
+                and self.precheck_purpose in {"start","safety"}
+            )
             or self.closing
         )
 
@@ -1143,11 +1258,17 @@ class TVCControlApp:
     def _invalidate_precheck(self):
         self.queue_revision+=1
         self.precheck_generation+=1
+        # Detach a bounded manual/startup check immediately. Its eventual event
+        # carries the old generation and cannot overwrite the replacement.
+        self.precheck_in_progress=False
+        self.precheck_purpose=""
+        self.runtime_check_in_progress=False
         self.precheck_valid=False
         self.valid_excel=False
         self.runtime_valid=False
         self.tvc_connected=False
         self.tvc_login_verified=False
+        self.bot_python=None
         for item in self.excel_queue.items:
             item.status="PENDING"
             item.message=""
@@ -1215,6 +1336,7 @@ class TVCControlApp:
         self._invalidate_precheck()
         self._refresh_queue_tree()
         self._refresh_progress()
+        self.retry_precheck()
 
     def clear_files(self):
         if not self._queue_edit_allowed() or not self.excel_queue.items:
@@ -1230,6 +1352,7 @@ class TVCControlApp:
         self._invalidate_precheck()
         self._refresh_queue_tree()
         self._refresh_progress()
+        self.retry_precheck()
 
     def move_selected_file(self,offset):
         if not self._queue_edit_allowed():
@@ -1240,6 +1363,7 @@ class TVCControlApp:
         new_index=self.excel_queue.move(indices[0],offset)
         self._invalidate_precheck()
         self._refresh_queue_tree(selection_index=new_index)
+        self.retry_precheck()
 
     def retry_precheck(self):
         return self._begin_precheck("manual")
@@ -1342,8 +1466,23 @@ class TVCControlApp:
         self.tvc_connected=bool(tvc.get("connected"))
         self.tvc_login_verified=bool(tvc.get("login_verified"))
         self.tvc_error="" if tvc.get("ready") else tvc.get("message","")
-        self.runtime_status_var.set("Ready" if self.runtime_valid else "Error")
-        self.tvc_status_var.set("Connected" if tvc.get("ready") else "Not Found")
+        self.runtime_status_var.set("พร้อม" if self.runtime_valid else "Error")
+        tvc_probe_status=str(tvc.get("status") or "").upper()
+        if tvc.get("ready"):
+            tvc_label="พร้อม"
+        elif tvc_probe_status=="TIMEOUT":
+            tvc_label="หมดเวลาตรวจสอบ"
+        elif tvc_probe_status=="ERROR":
+            tvc_label="Error"
+        elif tvc_probe_status in {"PENDING","SKIPPED"}:
+            tvc_label="ยังไม่ได้ตรวจ"
+        elif tvc_probe_status in {"LOGIN_REQUIRED","FOUND_NOT_READY","FOUND"}:
+            tvc_label="พบโปรแกรม - ยังไม่ยืนยัน Login"
+        elif tvc.get("connected"):
+            tvc_label="ยังไม่พร้อม"
+        else:
+            tvc_label="ยังไม่พบโปรแกรม"
+        self.tvc_status_var.set(tvc_label)
 
         by_path={str(item.path):item for item in self.excel_queue.items}
         for item_result in result.get("items",[]):
@@ -1397,8 +1536,15 @@ class TVCControlApp:
             self._set_mascot("READY")
             self.append_log("Pre-check ผ่านครบทุกหัวข้อ")
         else:
-            self._set_status("Error")
-            self._set_mascot("ERROR")
+            item_statuses={item.status for item in self.excel_queue.items}
+            waiting_for_setup=(
+                self.runtime_valid
+                and tvc_probe_status not in {"TIMEOUT","ERROR"}
+                and "INVALID" not in item_statuses
+                and "REVIEW_REQUIRED" not in item_statuses
+            )
+            self._set_status("รอความพร้อม" if waiting_for_setup else "Error")
+            self._set_mascot("READY" if waiting_for_setup else "ERROR")
             if not self.runtime_valid:
                 self.append_log(f"Runtime Error: {self.runtime_error}")
             if not tvc.get("ready"):
@@ -2121,6 +2267,7 @@ class TVCControlApp:
             "พร้อมใช้งาน":"#2563eb",
             "กำลังตรวจสอบระบบ...":"#d97706",
             "กำลังตรวจสอบก่อนเริ่ม...":"#d97706",
+            "รอความพร้อม":"#2563eb",
             "กำลังทำงาน":"#d97706",
             "กำลังหยุดหลังจบ JOB ปัจจุบัน":"#d97706",
             "หยุดแล้ว":"#2563eb",

@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 logs/
 screenshots/
+build/
+dist/
 .vscode/
 .idea/
 Thumbs.db

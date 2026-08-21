@@ -30,7 +30,35 @@ Flow ใหม่:
 - GUI และ worker ใช้ `src/runtime_paths.py` ร่วมกันสำหรับ config, field map,
   assets, logs และ screenshots; ไม่มี path ที่ผูกกับ `D:\BOT-PMS`
 - หาก app directory เขียนไม่ได้ logs/screenshots จะใช้ user-data directory ที่เขียนได้
-- รอบนี้เป็นการเตรียม architecture เท่านั้น ยังไม่มี PyInstaller spec และยังไม่ build `.exe`
+- Standalone v0.8.0 ใช้ PyInstaller ONEDIR โดยแยก Control/Worker spec และให้
+  Control เรียก Worker ที่อยู่ข้างกันอัตโนมัติเมื่อเริ่ม Queue
+
+## Build และใช้งาน Standalone v0.8.0
+
+ติดตั้ง build dependency หนึ่งครั้ง:
+
+```bat
+.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+```
+
+สร้าง distribution ใหม่:
+
+```bat
+BUILD_EXE.bat
+```
+
+ผลลัพธ์อยู่ที่ `dist\TVC_JOB_BOT_v0.8.0\` ผู้ใช้ต้องเก็บและแจกทั้งโฟลเดอร์
+รวม `_internal`, `assets`, `config.ini` และ `field_map.json` ห้ามคัดลอก
+เฉพาะไฟล์ EXE ออกไปใช้งานเดี่ยว ๆ
+
+การใช้งานทั่วไป:
+
+1. เปิดและเข้าสู่ระบบ T.V.C Client
+2. เปิด `TVC Bot Control.exe`
+3. เลือก Excel แล้วรอ Pre-check ผ่านก่อนกดเริ่ม
+
+`TVC Bot Worker.exe` เป็น console worker สำหรับ Control และยังรองรับ
+`--excel`, `--stop-file` และ `--help`
 
 ## Safety Lock
 
