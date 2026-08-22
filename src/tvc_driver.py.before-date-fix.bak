@@ -323,13 +323,8 @@ class TVCDriver:
         ctrl.set_focus()
 
         try:
-            # DateTimePickerWrapper.set_time expects SYSTEMTIME order:
-            # year, month, day_of_week, day, hour, minute, second, milliseconds.
-            # Python weekday(): Monday=0 ... Sunday=6
-            # Windows SYSTEMTIME: Sunday=0 ... Saturday=6.
-            day_of_week = (dt.weekday() + 1) % 7
             ctrl.set_time(
-                dt.year, dt.month, day_of_week, dt.day,
+                dt.year, dt.month, dt.day,
                 dt.hour, dt.minute, dt.second, 0
             )
         except Exception:
